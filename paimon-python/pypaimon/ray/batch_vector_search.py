@@ -51,15 +51,14 @@ class _RayBatchVectorSearchRead(BatchVectorSearchReadImpl):
         items = [(split, None if not pre_filters or pre_filters[i] is None
                   else pre_filters[i].serialize()) for i, split in enumerate(splits)]
         context = (self._table, self._vector_column, query, search_limit, self._options)
-        results = [None] * len(splits)
         with closing(_map_tasks(
-                _search_batch_index_split, context, items, self._concurrency, self._remote_args)) as tasks:
-            for ordinal, (metric, scores) in tasks:
+                _search_batch_index_split, context, items, self._concurrency, self._remote_args, True)) as tasks:
+            for _, (metric, scores) in tasks:
                 if metric is not None:
                     self._set_index_metric(metric)
                 # Retain plan order for duplicate IDs and global per-query selection.
-                results[ordinal] = [DictBasedScoredIndexResult(values) for values in scores]
-        return results
+                yield [DictBasedScoredIndexResult(values) for values in scores]
+                del scores
 
     def _read_raw_batch_search(self, raw_row_ranges, pre_filter, index_type=None, snapshot=None):
         heaps = [[] for _ in self._query_vectors]
@@ -71,6 +70,26 @@ class _RayBatchVectorSearchRead(BatchVectorSearchReadImpl):
                    self._limit, self._search_metric(index_type))
         with closing(_map_tasks(
                 _search_batch_raw_split, context, splits, self._concurrency, self._remote_args)) as tasks:
+            for _, results in tasks:
+                for heap, scores in zip(heaps, results):
+                    for row_id, score in scores.items():
+                        _offer_score(heap, self._limit, row_id, score)
+        return [_scored_result(heap) for heap in heaps]
+
+    def _stream_rerank_candidates(self, candidates, union_candidates, query_vectors,
+                                  index_type, snapshot):
+        # Candidates have already been selected globally, separately per query.
+        queries_by_row = {}
+        for query_index, result in enumerate(candidates):
+            for row_id in result.results():
+                queries_by_row.setdefault(row_id, []).append(query_index)
+        table_read, splits = self._plan_raw_read(
+            union_candidates.to_range_list(), include_filter=False, snapshot=snapshot)
+        context = (table_read, self._vector_column, query_vectors, self._limit,
+                   self._search_metric(index_type), queries_by_row)
+        heaps = [[] for _ in query_vectors]
+        with closing(_map_tasks(
+                _search_batch_refine_split, context, splits, self._concurrency, self._remote_args)) as tasks:
             for _, results in tasks:
                 for heap, scores in zip(heaps, results):
                     for row_id, score in scores.items():
@@ -107,6 +126,14 @@ def _search_batch_raw_split(context, split):
     reader, batches = table_read._new_arrow_batch_reader([split])
     with _ClosableArrowBatchReader(reader, batches) as batch_reader:
         return [_scores(result) for result in scorer._score_raw_batch_queries(batch_reader, metric)]
+
+
+def _search_batch_refine_split(context, split):
+    table_read, column, queries, limit, metric, queries_by_row = context
+    scorer = BatchVectorSearchReadImpl(table_read.table, limit, column, queries)
+    # Read the candidate union once, scoring each row only for its own queries.
+    return [_scores(result) for result in scorer._score_refine_splits(
+        table_read, [split], queries_by_row, queries, metric)]
 
 
 def _scores(result):

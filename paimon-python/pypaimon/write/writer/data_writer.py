@@ -31,6 +31,7 @@ from pypaimon.table.bucket_mode import BucketMode
 from pypaimon.table.row.generic_row import GenericRow
 from pypaimon.write.map_shared_shredding_writer import MapSharedShreddingWriter
 from pypaimon.write.writer.mosaic_writer_options import create_mosaic_writer_options
+from pypaimon.write.writer.parquet_writer_options import create_parquet_writer_options
 from pypaimon.write.writer.write_buffer import WriteBuffer
 
 
@@ -81,6 +82,13 @@ class DataWriter(ABC):
         self.changelog_file_format = (
             self.options.changelog_file_format()
             or self.file_format
+        )
+        self.parquet_writer_options = (
+            create_parquet_writer_options(self.options)
+            if self.file_format == CoreOptions.FILE_FORMAT_PARQUET
+            or (changelog_producer == ChangelogProducer.INPUT
+                and self.changelog_file_format == CoreOptions.FILE_FORMAT_PARQUET)
+            else {}
         )
         self.write_cols = write_cols
         self.blob_as_descriptor = self.options.blob_as_descriptor()
@@ -190,16 +198,12 @@ class DataWriter(ABC):
     def _delete_committed_files(self, file_metas: List[DataFileMeta]):
         for file_meta in file_metas:
             try:
-                path_to_delete = file_meta.external_path if file_meta.external_path else file_meta.file_path
-                if path_to_delete:
-                    path_str = str(path_to_delete)
-                    self.file_io.delete_quietly(path_str)
-                for extra_file in file_meta.extra_files:
-                    self.file_io.delete_quietly(self._aligned_extra_file_path(file_meta, extra_file))
+                for path_to_delete in file_meta.collect_files():
+                    self.file_io.delete_quietly(path_to_delete)
             except Exception as e:
                 import logging
                 logger = logging.getLogger(__name__)
-                path_to_delete = file_meta.external_path if file_meta.external_path else file_meta.file_path
+                path_to_delete = file_meta.physical_path()
                 logger.warning(f"Failed to delete file {path_to_delete} during abort: {e}")
 
     @abstractmethod
@@ -381,7 +385,9 @@ class DataWriter(ABC):
         if self._map_shared_shredding.is_active():
             return self._map_shared_shredding.write_parquet(
                 self.file_io, path, data, self.compression, self.zstd_level)
-        self.file_io.write_parquet(path, data, compression=self.compression, zstd_level=self.zstd_level)
+        self.file_io.write_parquet(
+            path, data, compression=self.compression, zstd_level=self.zstd_level,
+            **self.parquet_writer_options)
         return {}
 
     def _create_data_file_meta(self, file_name, file_path, row_count,
@@ -501,12 +507,7 @@ class DataWriter(ABC):
 
     @staticmethod
     def _aligned_extra_file_path(file_meta: DataFileMeta, extra_file: str) -> str:
-        if "://" in extra_file or extra_file.startswith("/"):
-            return extra_file
-        file_path = file_meta.external_path if file_meta.external_path else file_meta.file_path
-        if not file_path or "/" not in file_path:
-            return extra_file
-        return f"{file_path.rsplit('/', 1)[0]}/{extra_file}"
+        return file_meta.aligned_file_path(extra_file)
 
     @staticmethod
     def _find_optimal_split_point(data: pa.RecordBatch, target_size: int) -> int:

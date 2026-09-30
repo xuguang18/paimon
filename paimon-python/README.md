@@ -105,10 +105,154 @@ pip3 install dist/*.tar.gz
 
 The command will install the package and core dependencies to your local Python environment.
 
+# Row ID column updates
+
+For a batch update of selected columns in a data-evolution table with row
+tracking, pass an Arrow table containing `_ROW_ID` and the columns to update.
+Create the updater and committer from the same builder so they share a commit
+user:
+
+```python
+builder = table.new_batch_write_builder()
+updater = builder.new_update().new_update_by_row_id()
+messages = updater.update_columns(updates, ["name"])
+commit = builder.new_commit()
+try:
+    commit.commit(messages)
+finally:
+    commit.close()
+```
+
+For stream updates, use `table.new_stream_write_builder()` and pass the stream
+commit identifier to `new_update().new_update_by_row_id(commit_identifier)`.
+
+# Parquet page-index reads
+
+For row-tracking tables with a Parquet OffsetIndex, PyPaimon can read a
+contiguous `_ROW_ID` range, including standard VARIANT columns, without decoding
+the full row group. This is enabled by default and can be disabled with the table
+option:
+
+```python
+table = table.copy({"parquet.filter.columnindex.enabled": "false"})
+```
+
+Unsupported reads use the normal path. Reading fewer bytes may require more
+object-store requests.
+
+# Native write and commit
+
+PyPaimon can write Arrow batches through the optional `pypaimon-rust` runtime.
+Enable it on a table independently of native commit:
+
+```python
+native_table = table.copy({"write.native.enabled": "true",
+                           "commit.native.enabled": "true"})
+builder = native_table.new_batch_write_builder()
+writer, commit = builder.new_write(), builder.new_commit()
+try:
+    writer.write_arrow(data)
+    commit.commit(writer.prepare_commit())
+finally:
+    writer.close()
+    commit.close()
+```
+
+The native writer returns ordinary PyPaimon commit messages, so the Python
+committer also works when `commit.native.enabled` is false. Batch overwrite and
+reusable stream writers retain the builder's commit user and identifier. Native
+write supports Parquet append, primary-key and data-evolution tables, including
+top-level scalar BLOB Arrow columns, on the same filesystem/JDBC publication
+route as native commit. ARRAY/MAP BLOB, video and optional data-evolution row
+sidecars select the Python writer. Writer methods requiring Python's specialized
+path select the Python writer before native data is written. If the runtime or table route is
+unavailable, write uses Python. Once Rust starts writing a batch, errors
+propagate without retrying that batch through Python.
+
+Native writes honor `data-file.path-directory` and the configured
+`data-file.external-paths` strategy. Existing files keep their recorded locations
+when the write destinations change. Python and native readers and committers
+can exchange these files, including external data files and their index sidecars.
+
+BLOB Arrow values may contain payload bytes or serialized descriptors. Fields
+listed in `blob-descriptor-field` remain inline and require descriptors. HTTP(S)
+references use decoded response streams, including gzip and deflate. Blob
+files roll by payload size, independently of the normal Parquet files. Python
+`Blob` row objects can provide custom streams or URI readers; `write_row` on a
+BLOB table selects the Python writer before any native data is written. Switching
+to row writes after native Arrow writes is rejected. Use `write.native.enabled=false` when
+mixing Arrow batches and Python `Blob` objects in one writer.
+
+An explicit native writer `abort()` also deletes prepared files that have not
+been passed to a PyPaimon committer. Calling `close()` instead releases those
+files to the caller without deleting them; use `commit.abort(messages)` to
+discard them after closing the writer. Once a commit attempt starts, writer
+abort preserves its files even if the attempt raises, because a snapshot may
+already reference them. Stream writers retain cleanup ownership only for
+messages that have not been submitted to a committer.
+
+Both native options are disabled by default.
+
+# Native commit
+
+PyPaimon can submit append and batch overwrite commits through the optional
+`pypaimon-rust` runtime. Enable it independently of native planning and reading:
+
+```python
+native_table = table.copy({"commit.native.enabled": "true"})
+builder = native_table.new_batch_write_builder()
+writer, commit = builder.new_write(), builder.new_commit()
+try:
+    writer.write_arrow(data)
+    commit.commit(writer.prepare_commit())
+finally:
+    writer.close()
+    commit.close()
+```
+
+When only native commit is enabled, the Python writer produces files. Its commit
+messages cross the Java v14 wire format into `CommitMessage.deserialize()` and
+are committed by Rust. Batch and stream append commits retain the Python
+builder's commit user, identifier, empty-commit option, and batch one-shot
+lifecycle. Explicit abort also supports native cleanup of uncommitted files.
+
+For batch overwrite, configure the Python builder as usual:
+
+```python
+builder = native_table.new_batch_write_builder().overwrite({"pt": "2026-09-22"})
+```
+
+Overwrite preserves the Python commit user and follows the table's
+`dynamic-partition-overwrite` option. Dynamic overwrite replaces only partitions
+present in the messages and does nothing for empty input. Static overwrite
+replaces partitions matching the spec, including for empty input; an empty spec
+matches the whole table. Empty overwrite of an unpartitioned table truncates it.
+Static and unpartitioned overwrite record an OVERWRITE snapshot even when no
+files match, following Java; this also applies when the operation uses Python.
+
+Overwrite is configured only through `BatchWriteBuilder`, following Java's
+batch/stream API split. `StreamWriteBuilder` does not expose overwrite.
+
+Native commits require a runtime containing the batch identity bridge in
+[paimon-rust #916](https://github.com/apache/paimon-rust/pull/916), built on
+[#915](https://github.com/apache/paimon-rust/pull/915). If the optional runtime is
+not installed, commits use Python. The current native route supports main-branch
+tables using filesystem/JDBC catalogs or `FileStoreTable.from_path()` with
+standard FileIO. Truncate, REST/catalog-managed publication, custom
+FileIO/environments, commit callbacks, and snapshot properties use Python.
+Data-evolution updates that need Python's row-id conflict rewriting also retain
+the Python path. Compact increments remain unsupported by both committers.
+
+Fallback is limited to runtime availability, table construction and message
+conversion before a native mutation starts. A native commit error propagates;
+the adapter neither retries it through Python nor aborts files, since the
+snapshot may already have been published. The option is disabled by default.
+
 # Native scan planning
 
-PyPaimon can plan splits with the optional `pypaimon-rust` package while retaining
-the Python reader:
+PyPaimon can plan splits with the optional `pypaimon-rust` package. Planning and
+reading are independently selectable, so native plans can still use the Python
+reader:
 
 ```python
 native_table = table.copy({"scan.native-plan.enabled": "true"})
@@ -134,20 +278,26 @@ plan = builder.new_scan().plan()
 rows = builder.new_read().to_arrow(plan.splits())
 ```
 
-Native reads return PyArrow batches through the Arrow C Data interface. They
-currently require untouched splits produced by the native planner and top-level
-projection. Query authorization, nested projection, row-kind output, and
-explicit blob parallelism retain the Python reader. For materialized
-`to_arrow()` reads, the effective split parallelism (the method argument,
-`read.parallelism`, or the automatic default) runs independent Rust readers
-over contiguous split groups. Streaming `to_arrow_batch_reader()` keeps one
-lazy Rust reader. A missing reader capability, unsupported route, or
-native-reader construction failure falls back to Python; I/O and data errors
-raised after streaming starts surface to the caller.
+Native reads return PyArrow batches through the Arrow C Data interface. Native
+planner handles are used directly when available; splits refined by Python
+index or shuffle logic are serialized through the stable split contract and
+reconstructed by Rust. Nested projection and row-kind output are supported.
+Query authorization retains the Python reader. For both materialized
+`to_arrow()` and streaming `to_arrow_batch_reader()` reads, the effective split
+parallelism (the method argument, `read.parallelism`, or the automatic default)
+runs independent Rust readers. Splits stay in input order but contiguous groups
+are balanced by physical file bytes to reduce worker skew. An unfiltered row
+limit also caps reader fan-out to avoid speculative work.
+Streaming buffers at most one batch per reader and closing the batch reader
+interrupts native reads that are still in flight. A missing reader capability,
+unsupported route, or native-reader construction failure falls back to Python;
+I/O and data errors raised after streaming starts surface to the caller.
 
-With Rust main's `Table.from_resolved_schema()` binding, filesystem and JDBC catalog
-tables preserve the Python table's resolved schema and complete effective
-options. Stale table objects, historical schemas, and `copy()` overrides or
+Native planning and reading require Rust's resolved-schema bindings:
+`Table.from_resolved_schema()` for filesystem, JDBC and path-based tables, and
+`Table.copy_with_resolved_schema()` for REST tables. The adapter passes the Python
+table's resolved schema and complete effective options without an option whitelist.
+Stale table objects, historical schemas, and `copy()` overrides or
 option removals no longer require catalog reloading or Python planning.
 Tables opened with `FileStoreTable.from_path(path, file_io_options=None)` use
 the same path with standard local, PyArrow or resolving FileIO. Storage options
@@ -156,6 +306,8 @@ JDBC planning uses the resolved table location and storage properties without
 opening another database connection.
 REST tables use `Table.copy_with_resolved_schema()` to preserve the same schema
 and option semantics, including branches whose schemas are catalog-managed.
+Matching REST tables retain the native environment across scans and read-option
+copies, preserving FileIO caches. Worker deserialization creates a fresh environment.
 The native table retains REST credentials, token refresh and catalog snapshot
 resolution. Database and table names containing dots are passed as separate
 identifier components. REST snapshot results (including empty results) take precedence over
@@ -178,20 +330,28 @@ When using an unreleased 0.4.0 development wheel, rebuild it with these fixes;
 package version checks cannot distinguish local builds with identical versions.
 
 Append scans support `with_shard()` and `with_slice()` with Rust 0.4 or newer,
-which preserves the file order needed for positional selection; primary-key scans support
-bucket-based `with_shard()`. Data-evolution position selection requires the
-binding's `TableScan.with_row_position_slice()` and `with_row_position_shard()`.
+which plans positional selection directly into native-readable splits; primary-key
+scans support bucket-based `with_shard()`. Both append and data-evolution position
+selection require the binding's `TableScan.with_row_position_slice()` and
+`with_row_position_shard()`. Ordinary append positions follow the stats-pruned
+split/file order, while Data Evolution assigns positions before group pruning.
 Selection occurs before reader filtering and deletion vectors, so surviving row
 counts can differ between shards. Limits are applied after shard/slice selection.
 
 Timestamp incremental scans require `ReadBuilder.new_incremental_scan()` and
 stream-aware splits exposing `Split.is_streaming()`. Python resolves
 `(start_timestamp, end_timestamp]` to snapshot IDs; Rust packs the selected APPEND
-deltas into one plan. Like Java, readers retain physical change events, including
-repeated primary keys and retracts across commits. They do not merge the window
-into a final table state or apply endpoint deletion vectors or global indexes.
-Other commit kinds are excluded; the ending snapshot still supplies plan metadata.
-Rebuild development wheels from Rust main to obtain this contract.
+deltas into one plan. Continuous streaming uses the same native path for initial
+and delta frames. When `changelog-producer` is enabled, follow-up frames request
+Rust's explicit `changelog` mode and read the physical changelog manifests.
+OVERWRITE changelog frames retain per-snapshot Python planning because Java
+streaming reads them while Java and Rust range-based incremental scans skip
+OVERWRITE; the resulting splits can still use native reads.
+Like Java, readers retain physical change events, including repeated primary
+keys and retracts across commits. They do not merge the window into a final
+table state or apply endpoint deletion vectors or global indexes. Other commit
+kinds are excluded; the ending snapshot still supplies plan metadata. Rebuild
+development wheels from Rust main to obtain this contract.
 
 `scan.version` supports tags, snapshot IDs and `watermark-<value>`, resolving tags
 first and using the historical schema. Ordinary postpone-bucket batch scans can
@@ -225,7 +385,9 @@ index reader, preserving merge-required splits and the selected snapshot.
 
 Query authorization, first-row plans mixing L0 with merge-required materialized files,
 and precomputed primary-key global-index results still use the Python planner.
-Continuous streaming and write planning also retain their Python entrypoints.
+Continuous streaming retains Python polling and resume handling, while its
+initial, delta and physical-changelog frames can use native planning and reads.
+Write planning retains its Python entrypoint.
 Native planning remains optional and is disabled by default.
 
 # Coalesced BLOB reads
