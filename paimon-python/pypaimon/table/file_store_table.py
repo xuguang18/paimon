@@ -461,7 +461,8 @@ class FileStoreTable(Table):
 
     def create_global_index(self, index_column, index_type: str = "btree",
                             partition_filter=None, partitions=None,
-                            options: Optional[dict] = None) -> int:
+                            options: Optional[dict] = None, *, execution="local",
+                            concurrency=None, ray_remote_args=None) -> int:
         from pypaimon.globalindex.create_global_index import \
             create_global_index
         return create_global_index(
@@ -471,6 +472,7 @@ class FileStoreTable(Table):
             partition_filter=partition_filter,
             partitions=partitions,
             options=options,
+            execution=execution, concurrency=concurrency, ray_remote_args=ray_remote_args,
         )
 
     def drop_global_index(self, index_column, index_type: str = "btree",
@@ -520,7 +522,12 @@ class FileStoreTable(Table):
     def _copy_with_snapshot(self, snapshot):
         """Keep one resolved read view, including tag metadata and empty tables."""
         from pypaimon.snapshot.time_travel_util import SCAN_KEYS
-        options = {key: None for key in SCAN_KEYS if key in self.table_schema.options}
+        selectors = SCAN_KEYS + [
+            CoreOptions.INCREMENTAL_BETWEEN_TIMESTAMP.key(),
+            CoreOptions.SCAN_FILE_CREATION_TIME_MILLIS.key(),
+            CoreOptions.SCAN_CREATION_TIME_MILLIS.key(),
+        ]
+        options = {key: None for key in selectors if key in self.table_schema.options}
         options[CoreOptions.SCAN_MODE.key()] = "from-snapshot" if snapshot is not None else "default"
         if snapshot is not None:
             options[CoreOptions.SCAN_SNAPSHOT_ID.key()] = str(snapshot.id)
@@ -613,21 +620,19 @@ class FileStoreTable(Table):
             historical_schema: TableSchema, options: Options, dynamic_option_keys: Set[str]) -> dict:
         # Keep scan and runtime options, but restore column declarations to match historical fields.
         historical_options = dict(options.to_map())
-        for key in (
-                CoreOptions.VECTOR_FIELD.key(),
-                CoreOptions.BLOB_FIELD.key(),
-                CoreOptions.BLOB_DESCRIPTOR_FIELD.key(),
-                CoreOptions.BLOB_VIEW_FIELD.key(),
-                # Restore the legacy key verbatim, not as a canonical descriptor option:
-                # Python intentionally ignores it when choosing the read layout.
-                'blob.stored-descriptor-fields'):
-            if key in dynamic_option_keys:
+        for keys in (
+                (CoreOptions.VECTOR_FIELD.key(),),
+                (CoreOptions.BLOB_FIELD.key(),),
+                (CoreOptions.BLOB_DESCRIPTOR_FIELD.key(), 'blob.stored-descriptor-fields'),
+                (CoreOptions.BLOB_VIEW_FIELD.key(),)):
+            if any(key in dynamic_option_keys for key in keys):
                 # Preserve explicit overrides and removals, including those from earlier copies.
                 continue
-            if key in historical_schema.options:
-                historical_options[key] = historical_schema.options[key]
-            else:
-                historical_options.pop(key, None)
+            for key in keys:
+                if key in historical_schema.options:
+                    historical_options[key] = historical_schema.options[key]
+                else:
+                    historical_options.pop(key, None)
         return historical_options
 
     def _create_external_paths(self) -> List[str]:

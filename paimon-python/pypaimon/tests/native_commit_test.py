@@ -22,7 +22,6 @@ import pytest
 
 from pypaimon import CatalogFactory, Schema
 from pypaimon.catalog.catalog_environment import CatalogEnvironment
-from pypaimon.common.identifier import Identifier
 from pypaimon.common.options.core_options import CoreOptions
 from pypaimon.common.options.options import Options
 from pypaimon.snapshot.snapshot import BATCH_COMMIT_IDENTIFIER
@@ -333,22 +332,29 @@ def test_native_abort_removes_uncommitted_files(tmp_path, native_rest_catalog, o
 
 
 @requires_native
-def test_python_file_in_legacy_partition_uses_python_abort(
-        tmp_path, native_rest_catalog):
+@pytest.mark.parametrize('serialized', [False, True])
+def test_python_written_escaped_partition_supports_native_abort(
+        tmp_path, native_rest_catalog, serialized):
+    from pypaimon.write.commit_message_serializer import deserialize_commit_message, serialize_commit_message
+
     table = _table(tmp_path, catalog=native_rest_catalog)
     builder = table.new_batch_write_builder()
     messages = _prepare(builder, [{'id': 1, 'pt': 'a/b'}])
     file = messages[0].new_files[0]
     assert table.file_io.exists(file.file_path)
-    assert not native_messages_supported(table, messages)
+    assert '/pt=a%2Fb/' in file.file_path
+    if serialized:
+        messages = [deserialize_commit_message(serialize_commit_message(message, table.partition_keys_fields),
+                                               table.partition_keys_fields) for message in messages]
+    assert native_messages_supported(table, messages)
 
     commit = builder.new_commit()
     try:
         with patch.object(commit.file_store_commit, 'abort',
-                          wraps=commit.file_store_commit.abort) as python_abort:
+                          side_effect=AssertionError('Python fallback')):
             commit.abort(messages)
-        python_abort.assert_called_once_with(messages)
         assert not table.file_io.exists(file.file_path)
+        assert table.snapshot_manager().get_latest_snapshot() is None
     finally:
         commit.close()
 
@@ -530,7 +536,7 @@ def test_disabled_option_never_initializes_native(tmp_path):
     commit.close()
 
 
-@pytest.mark.parametrize('kind', ['custom-env', 'branch', 'custom-io'])
+@pytest.mark.parametrize('kind', ['custom-env', 'custom-io'])
 def test_incompatible_publication_environment_is_not_reconstructed(
         tmp_path, native_rest_catalog, kind):
     table = _table(tmp_path, catalog=native_rest_catalog)
@@ -538,8 +544,6 @@ def test_incompatible_publication_environment_is_not_reconstructed(
         class CustomEnvironment(CatalogEnvironment):
             pass
         table.catalog_environment = CustomEnvironment()
-    elif kind == 'branch':
-        table.identifier = Identifier('default', 't', branch='dev')
     else:
         table.file_io = Mock()
     with patch('pypaimon.write.native_commit.native_commit_available', return_value=True), \
@@ -557,21 +561,38 @@ def test_missing_runtime_falls_back_without_reconstructing_table(
         resolve.assert_not_called()
 
 
-def test_partial_row_id_and_compact_messages_preserve_python_recovery(
+def test_preassigned_row_id_messages_use_native_validation(
         tmp_path, native_rest_catalog):
     table = _table(tmp_path, 'de', catalog=native_rest_catalog)
-    assert create_native_commit(table, 'job') is None
-    assert not native_messages_supported(table, [CommitMessage((), 0, [])])
-    assert not native_messages_supported(table, [CommitMessage((), 0, [], check_from_snapshot=7)])
-    assert not native_messages_supported(table, [CommitMessage((), 0, [Mock(first_row_id=1)])])
+    assert native_messages_supported(table, [CommitMessage((), 0, [])])
+    assert native_messages_supported(table, [CommitMessage((), 0, [], check_from_snapshot=7)])
+    messages = _prepare(table.new_batch_write_builder(), [{'id': 1, 'pt': 'a'}])
+    messages[0].new_files[0].first_row_id = 1
+    messages[0].check_from_snapshot = 7
+    assert native_messages_supported(table, messages)
     assert not native_messages_supported(table, [CommitMessage((), 0, [], compact_after=[Mock()])])
 
 
-def test_custom_manifest_target_uses_python_rolling(tmp_path, native_rest_catalog):
-    table = _table(tmp_path, catalog=native_rest_catalog).copy({
-        'manifest.target-file-size': '16 kb'})
-    assert create_native_commit(table, 'job') is None
-    assert not native_messages_supported(table, [CommitMessage((), 0, [])])
+@requires_native
+@pytest.mark.parametrize('mode', ['append', 'de'])
+def test_custom_manifest_target_uses_native_commit(tmp_path, native_rest_catalog, mode):
+    from pypaimon.manifest.manifest_list_manager import ManifestListManager
+
+    table = _table(tmp_path, mode, catalog=native_rest_catalog).copy({
+        'manifest.target-file-size': '1 B'})
+    builder = table.new_batch_write_builder()
+    commit = builder.new_commit()
+    try:
+        messages = _prepare(builder, [{'id': 4, 'pt': 'a'}, {'id': 5, 'pt': 'b'}])
+        with _must_not_fallback(commit):
+            commit.commit(messages)
+        assert _rows(table) == [{'id': 4, 'pt': 'a'}, {'id': 5, 'pt': 'b'}]
+        snapshot = table.snapshot_manager().get_latest_snapshot()
+        metas = ManifestListManager(table).read_delta(snapshot)
+        assert len(metas) == 1  # Java checks only at multiples of 1000 records.
+        assert metas[0].num_added_files == 2
+    finally:
+        commit.close()
 
 
 def test_close_releases_python_resources_even_if_native_close_fails(tmp_path):

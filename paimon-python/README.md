@@ -10,10 +10,25 @@ This PyPi package contains the Python APIs for using Paimon.
 
 Pypaimon requires Python 3.6+.
 
-# Dependencies
+# Build
 
-The core dependencies are listed in `dev/requirements.txt`.
-The development dependencies are listed in `dev/requirements-dev.txt`.
+Run from `paimon-python/` with pip supporting dependency groups.
+
+Normal build:
+
+```shell
+python -m pip install --group build
+python -m build
+```
+
+Development build (editable installation with development dependencies):
+
+```shell
+python -m pip install -e . --group dev
+python -m build
+```
+
+Both produce a source archive and wheel in `dist/`.
 
 # OSS metadata commits
 
@@ -89,22 +104,6 @@ All concurrent writers must use conditional creation. Older Python clients or
 other clients that overwrite snapshot objects can still overwrite a successful
 commit. This change does not add conditional writes for other object stores.
 
-# Build
-
-You can build the source package by executing the following command:
-
-```commandline
-python3 setup.py sdist
-```
-
-The package is under `dist/`. Then you can install the package by executing the following command:
-
-```commandline
-pip3 install dist/*.tar.gz
-```
-
-The command will install the package and core dependencies to your local Python environment.
-
 # Row ID column updates
 
 For a batch update of selected columns in a data-evolution table with row
@@ -169,6 +168,102 @@ path select the Python writer before native data is written. If the runtime or t
 unavailable, write uses Python. Once Rust starts writing a batch, errors
 propagate without retrying that batch through Python.
 
+For primary-key Row writes, `rowkind.field` takes precedence over the object's `RowKind`; otherwise the object event is preserved. Plain Arrow input defaults to INSERT. Both Python and native writers apply `ignore-delete` and `ignore-update-before` before routing object rows.
+
+Batch and stream `merge_into` also use Rust core for eligible data-evolution
+Parquet tables when `write.native.enabled=true`. Existing `WhenMatched` and
+`WhenNotMatched` clauses accept Arrow/pandas input, Paimon table sources, or
+self-merge on `_ROW_ID`.
+Core pins the target snapshot, matches keys, selects the first satisfied clause
+and prepares updates, deletion vectors and inserts. SQL conditions, including
+subqueries, execute in the Rust DataFusion adapter; Python transports the
+normalized clauses and returned commit messages. Conditional MERGE requires
+Python 3.10+ and the existing `pypaimon[sql]` extra, which installs both Python
+DataFusion and `pypaimon-rust`. Shared clause validation checks that dependency
+before native execution. NULL keys do not match.
+Multiple source rows matching a target are rejected before action conditions,
+except for a sole unconditional DELETE, following Paimon Spark MERGE.
+For table sources, core independently pins the selected source branch/snapshot
+and reads only keys and referenced columns. Append and primary-key sources do
+not require data evolution. Source scan options select the same point in time
+on Python and native paths. Numeric `incremental-between-timestamp` source
+windows are resolved and read by core. Non-REST Blob views
+requiring catalog resolution and packed-video inserts use the Python path
+selected before native execution starts. Native failures propagate without
+Python retry or deleting files from earlier prepared actions.
+
+Python and native writers use Java's escaped partition directories for data,
+changelog, Blob and row sidecar files, including external locations. Both
+planners, file-range metadata, commit callbacks and explicit aborts use the same
+path rules. Row sidecar reads resolve that path even when the primary file is
+unavailable.
+
+MAP columns configured with `fields.<name>.map.storage-layout=shared-shredding`
+also use native Parquet writes and data-evolution updates, including predicate
+updates and upserts. Rust applies Java's `plain`, `sequential` and `lru` column
+placement policies (`lru` by default), and adapts the physical column count
+between completed files. Files remain readable by the Python reader, including
+literal MAP-key projections. Shared-shredding requires `none`, `lz4` or `zstd`
+compression.
+
+Primary-key dynamic buckets (`bucket=-1`, with partition fields included in the
+primary key) also support native writes. HASH indexes are restored across writer
+restarts; `dynamic-bucket.max-buckets` bounds bucket growth and reuses existing
+buckets after that limit. Dynamic buckets use the trimmed primary key, so
+`bucket-key` must not be configured. As in Java, each bucket must have one writer
+owner: a HASH ADD replaces the complete previous index and does not carry a
+concurrent-writer baseline. Partitions with existing data but missing HASH indexes
+must be rewritten before incremental writes.
+
+Cross-partition primary keys (`bucket=-1`, with some partition columns outside
+of the primary key) also support native writes. Rust rebuilds the global index
+from live rows on writer startup and preserves the full primary key. Deduplicate
+moves a key by deleting its old location; first-row keeps its first partition;
+partial-update and aggregation apply changes in the existing partition, matching
+Java. Use one writer owner for the global key space. Index TTL is not supported,
+and `sequence.field` and `bucket-key` are invalid for this mode. The Python writer
+does not implement cross-partition routing, so this mode requires the native runtime.
+
+Ordinary postpone writes (`bucket=-2`) support native Parquet deduplicate writes
+without BLOB columns. Pending files retain input order, row kinds and duplicates, and
+roll at a batch boundary after reaching `target-file-row-num`. Normal scans expose
+only real buckets after deferred bucket assignment. Other postpone merge engines,
+BLOB writes use the Python writer.
+
+The fixed-bucket postpone builder uses native Parquet writes for deduplicate,
+first-row, partial-update and aggregation when supplied with a shared bucket plan
+or `postpone.default-bucket-num`. The default count is used exactly, without
+rounding or applying the inference limit. Append reuses each existing partition's
+bucket count; overwrite uses the new count for overwritten partitions. Pending
+files may coexist with real buckets and remain available for later assignment.
+
+```python
+from pypaimon.write.postpone_bucket import PostponeBucketPlan
+
+# A driver can serialize this small plan and give it to every worker.
+plan = PostponeBucketPlan({("2026-10-01",): 3, ("2026-10-02",): 5})
+builder = table.new_postpone_fixed_bucket_write_builder().with_bucket_plan(plan)
+writer = builder.new_write()
+try:
+    writer.write_arrow(arrow_table)
+    messages = writer.prepare_commit()
+finally:
+    writer.close()
+builder.new_commit().commit(messages)
+```
+
+All rows for one partition/bucket must have one writer owner. Python and native
+committers reject overlapping owners or writes that became stale after their
+baseline snapshot. Different real buckets and pending files can be appended
+concurrently. Overwrite detects concurrent changes to any overwritten partition.
+A shared plan must cover every input partition; a configured default does not
+fill missing entries in an explicit plan. Ray workers use native routing and
+writing with the driver's shared plan.
+
+Local automatic size estimation still uses the Python planner. Fixed-bucket
+native writes currently exclude BLOB and deletion-vector tables. They do not
+perform staging, compaction or automatic rescaling of existing partitions.
+
 Native writes honor `data-file.path-directory` and the configured
 `data-file.external-paths` strategy. Existing files keep their recorded locations
 when the write destinations change. Python and native readers and committers
@@ -183,13 +278,14 @@ BLOB table selects the Python writer before any native data is written. Switchin
 to row writes after native Arrow writes is rejected. Use `write.native.enabled=false` when
 mixing Arrow batches and Python `Blob` objects in one writer.
 
-An explicit native writer `abort()` also deletes prepared files that have not
-been passed to a PyPaimon committer. Calling `close()` instead releases those
-files to the caller without deleting them; use `commit.abort(messages)` to
-discard them after closing the writer. Once a commit attempt starts, writer
-abort preserves its files even if the attempt raises, because a snapshot may
-already reference them. Stream writers retain cleanup ownership only for
-messages that have not been submitted to a committer.
+A successful `prepare_commit()` transfers file ownership to the caller.
+Writer `abort()` and `close()` preserve those prepared files and may clean only
+outputs still owned by the writer. Explicit `commit.abort(messages)` deletes
+newly written data, changelog, sidecars and added indexes, matching Java's
+Paimon Table committer. Call it only when those messages are known to be
+uncommitted and will never be submitted. Never call it after a commit with an
+unknown outcome: publication may have succeeded before its response failed.
+Internal failure paths preserve prepared files instead of calling commit abort.
 
 Both native options are disabled by default.
 
@@ -318,14 +414,15 @@ Explicit row ranges on data-evolution tables require `ReadBuilder.with_row_range
 Watermark time travel requires Rust 0.4 or newer. Branch reads require the
 branch-aware binding exposing `Table.branch()`, and the resolved branch is
 checked before planning. Deletion-vector scans require `pypaimon-rust>=0.4.0`,
-which includes schema-aware decoding of Python-written index manifests and
-legacy bucket-index path compatibility. The reader honors explicit paths, then
-bucket paths, and can read older Python files placed in `table/index`.
+which includes schema-aware decoding of index manifests. Index paths follow
+Java: an explicit external path takes precedence; otherwise
+`index-file-in-data-file-dir` selects the bucket or table index directory.
 Bucket paths use the partition field types and `partition.legacy-name` to match
 Java formatting, including timestamp precision and different JVM float spellings.
-New Python writes honor `index-file-in-data-file-dir` and retain explicit paths
-when Python and Java partition-directory formatting differs. Older releases
-and prereleases before 0.4.0 use the Python planner for deletion vectors.
+Python bucket-index writes use Java partition paths. Explicit paths identify
+external files and floating partition directories whose spelling depends on the
+JDK version. Missing bucket indexes fail instead of searching Python layouts. Older releases and prereleases
+before 0.4.0 use the Python planner for deletion vectors.
 When using an unreleased 0.4.0 development wheel, rebuild it with these fixes;
 package version checks cannot distinguish local builds with identical versions.
 
@@ -341,7 +438,10 @@ counts can differ between shards. Limits are applied after shard/slice selection
 Timestamp incremental scans require `ReadBuilder.new_incremental_scan()` and
 stream-aware splits exposing `Split.is_streaming()`. Python resolves
 `(start_timestamp, end_timestamp]` to snapshot IDs; Rust packs the selected APPEND
-deltas into one plan. Continuous streaming uses the same native path for initial
+deltas into one plan. Equal timestamp bounds produce an empty result, as in Java.
+AUTO selects physical changelog files when a changelog producer is configured;
+each split carries the selected ending snapshot ID. Numeric bounds use signed
+64-bit milliseconds and Java's integer syntax. Continuous streaming uses the same native path for initial
 and delta frames. When `changelog-producer` is enabled, follow-up frames request
 Rust's explicit `changelog` mode and read the physical changelog manifests.
 OVERWRITE changelog frames retain per-snapshot Python planning because Java
@@ -664,6 +764,29 @@ unsupported platform such as Windows), `pypaimon` automatically falls
 back to the `pyarrow` (`libhdfs`/JVM) path and logs a warning. Disable
 the fallback with `hdfs.client.fallback-to-pyarrow=false` if you want
 hard failures instead.
+
+
+# Native local vector search
+
+For REST tables, `read.native.enabled=true` also delegates local vector search
+execution to Rust. Single-vector searches support Data Evolution and configured
+PK vector indexes; batch searches use the existing Data Evolution result API.
+
+```python
+native_table = table.copy({'read.native.enabled': 'true'})
+result = (native_table.new_vector_search_builder()
+          .with_vector_column('embedding')
+          .with_query_vector([1.0, 0.0])
+          .with_limit(10)
+          .execute_local())
+```
+
+Rust plans one snapshot, applies scalar and partition filters before Top-K,
+searches indexes, scans uncovered rows and performs refinement. The returned
+Python result can be passed to `with_global_index_result` as usual, including
+scored physical-position splits for PK tables. An unavailable native backend
+falls back to the Python search reader. Distributed Ray searches keep their
+existing scan/read path.
 
 
 # Vector index range reads
